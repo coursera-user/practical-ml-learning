@@ -1,0 +1,285 @@
+---
+output:
+  html_document: default
+  pdf_document: default
+---
+# Practical Machine Learning Course Project - Coursera
+### Executive summary
+In this document we explore the Human Activity Recognition (HAR) dataset (http://web.archive.org/web/20161224072740/http:/groupware.les.inf.puc-rio.br/har). This dataset contains data from accelerometers on the belt, forearm, arm, and dumbell of 6 participants. They were asked to perform barbell lifts correctly and incorrectly in 5 different ways. We try to predict the manner in which the participants performed the excercise based on this data.\newline
+The models that we try are: Naive Bayes, Random Forest, and Support Vector Machines (SVM).\newline
+We try models with only gyroscopic features, as we hypothesise that these say a lot about the manner in which the excersise was performed. Also we try models with all features included.\newline
+We find the Random Forest model to outperform the others, with a 90% accuracy with only the gyroscopic features and 99% accuracy with all features.
+
+## Part 1 - Data exploration
+
+#### 0. Load libraries
+```{r load_libraries, eval = TRUE, message=FALSE, echo = FALSE, warning= FALSE}
+library("knitr")
+library("lubridate") # for date parsing
+library("dplyr")
+library("ggplot2")
+library("tidyr")
+library("Hmisc")
+library("DataExplorer")
+library("anytime")
+library("caret")
+library("data.table")
+
+set.seed(1)
+```
+
+#### 1 Load data
+```{r load_data, eval = TRUE,}
+df_train_path <- file.path(getwd(), "data", "pml-training.csv")
+print(paste("Reading training data from:", df_train_path))
+df_train <- read.csv(df_train_path)
+#head(df_train, 5)
+
+df_test_path <- file.path(getwd(), "data", "pml-testing.csv")
+print(paste("Reading testing data from:", df_test_path))
+df_test <- read.csv(df_test_path)
+#head(df_test, 5)
+
+print(paste("Number of rows in training data:", nrow(df_train)))
+print(paste("Number of cols in training data:", length(names(df_train))))
+print(paste("Number of rows in test data    :", nrow(df_test)))
+print(paste("Number of cols in test data    :", length(names(df_test))))
+
+# Merge two dataframes
+df_test$classe <- NA
+df_train$problem_id <- NA
+df_train$dataset <- "training"
+df_test$dataset <- "test"
+
+df <- rbind(df_train, df_test)
+#head(df)
+
+```
+
+### 
+
+#### 2. Check column types
+```{r check_col_types, eval = TRUE,}
+num_cols <- names(df)[sapply(df, is.numeric)]
+integer_cols <- names(df)[sapply(df, is.integer)]
+factor_cols <- names(df)[sapply(df, is.factor)]
+
+print("Numeric columns:")
+print(num_cols)
+print("Integer columns:")
+print(integer_cols)
+print("Factor columns:")
+print(factor_cols)
+``` 
+Some columns are set as a factor, though they are numeric. Let's fix that before exploring the data further. Also timestamp is not read well. Let's also fix that.
+
+
+#### 3. Fix columnn types
+```{r fix_factor_cols, eval = TRUE,}
+non_feature_cols <- c("X", "user_name", "raw_timestamp_part_1", "raw_timestamp_part_2", "cvtd_timestamp", "new_window", "problem_id", "classe", "dataset")
+feature_cols <- setdiff(names(df), non_feature_cols)
+factor_cols_to_fix <- factor_cols[!(factor_cols %in% non_feature_cols)]
+df[factor_cols_to_fix] <- lapply(df[factor_cols_to_fix], as.numeric) 
+df$raw_timestamp_part_1 <- as_datetime(df$raw_timestamp_part_1)
+df$raw_timestamp_part_2 <- df$raw_timestamp_part_1 + df$raw_timestamp_part_2
+df$raw_timestamp_part_2 <- as_datetime(df$raw_timestamp_part_2)
+df$cvtd_timestamp <- as_datetime(as.character(df$cvtd_timestamp), format = "%d/%m/%Y %H:%M")
+
+```
+
+Before exploring, let's delete columns that we are not going to use anyway. These are columns that either i) contain a lot of NA values, or ii) contain almost no variance in the data.
+
+#### 4. Delete irrelevant columns
+```{r relevant_cols, eval = TRUE,}
+# Delete columns where we have too little data (Less than 10% of the rows)
+na_perc_per_col <-sapply(df, function(y) sum(length(which(is.na(y)))) / length(y))
+old_ncol = ncol(df)
+
+non_feature_cols_mask <- names(df) %in% non_feature_cols
+df <- df[, na_perc_per_col < .1 | non_feature_cols_mask]
+feature_cols <- intersect(feature_cols, names(df))
+
+print(paste("Columns deleted:", old_ncol - ncol(df), "because those columns contain more than 90% NA values"))
+print(paste("Columns left:", ncol(df)))
+
+# Delete columns with near zero values
+nzv_cols <- names(df[feature_cols])[nearZeroVar(df[feature_cols])]
+old_ncol = ncol(df)
+df <- subset(df, select = !names(df) %in% nzv_cols)
+feature_cols <- intersect(feature_cols, names(df))
+print(paste("Columns deleted:", old_ncol - ncol(df) ))
+print(paste("Columns left:", ncol(df)))
+
+# Delete rows with any NAs
+old_nrow <- nrow(df)
+df[feature_cols] <- na.omit(df[feature_cols])
+print(paste("Deleted:", old_nrow - nrow(df), "rows because they contain some NAs"))
+
+df_train <- df[df$dataset=="training",]
+df_test <- df[df$dataset=="test",]
+
+```
+
+
+## Part 2 - Data preparation
+For the creation of a model, we take 
+
+```{r data_prep, eval = TRUE,}
+dt_train <- as.data.table(df_train)
+dt_test <- as.data.table(df_test)
+dt <- as.data.table(df)
+
+rm(df_train)
+rm(df_test)
+rm(df)
+```
+
+### Part 3 - Modelling with only gyroscope features
+Our first hypothesis is that all gyroscope features are important for detecting the right movement so let's see how the models perform with only these features (see Appendix for exploratory figures).
+
+#### 1. Train models
+```{r train_models, eval=TRUE}
+
+# Select features
+selected_feature_cols <- feature_cols
+gyro_cols_bools <- sapply(feature_cols, function(x) startsWith(x, "gyro"))
+selected_feature_cols <- feature_cols[gyro_cols_bools]
+
+# Create train and test vectors
+X_train <- dt_train[, ..selected_feature_cols]
+y_train <- dt_train$classe
+X_test <- dt_test[, ..selected_feature_cols]
+y_test <- dt_test$classe
+
+# Define some variables
+seed <- 7
+set.seed(seed)
+metric <- "Accuracy"
+
+# Train models
+control <- trainControl(method="cv", number=4, verboseIter = FALSE)
+tunegrid <- expand.grid(.mtry=c(1:5))
+
+# Models were already ran and saved to disk, so loading instead
+#rf <- train(X_train, y_train, method="rf", metric=metric, tuneGrid=tunegrid, trControl=control)
+#nb = train(X_train, y_train,'nb', trControl=trainControl(method='cv',number=4))
+#svm = train(X_train, y_train,'svmLinear', trControl=trainControl(method='cv',number=4))
+rf <- readRDS("./rf_gyros_feats.rds")
+nb <- readRDS("./nb_gyros_feats.rds")
+svm <- readRDS("./svm_gyros_feats.rds")
+
+
+```
+
+```{r print_train_res, message=FALSE, WARNING=FALSE}
+print(nb)
+print(rf)
+print(svm)
+```
+
+#### 2. Test models
+```{r test_models, eval=TRUE}
+# Test models (not possible to get results as we don't have the labels)
+#rf_pred <-predict(rf, dt_test)
+#rf_cm <- confusionMatrix(rf_pred, dt_test$classe,  mode = "prec_recall")
+#nb_pred <-predict(nb, dt_test)
+#nb_cm <- confusionMatrix(nb_pred, dt_test$classe, mode = "prec_recall")
+#svm_pred <-predict(svm, dt_test)
+#svm_cm <- confusionMatrix(svm_pred, dt_test$classe,  mode = "prec_recall")
+
+```
+
+#### 3. Save results
+```{r save_results, eval=TRUE}
+# Save results
+train_accuracies <- c(max(rf$results$Accuracy), max(nb$results$Accuracy), svm$results$Accuracy)
+model1_results  <- data.frame("classifier" = c("rf", "nb", "svm"), "train_accuracy"= train_accuracies)
+model1_results$description <- "gyro_features"
+model1_results$n_features <- length(selected_feature_cols)
+saveRDS(rf, "./rf_gyros_feats.rds")
+saveRDS(nb, "./nb_gyros_feats.rds")
+saveRDS(svm, "./svm_gyros_feats.rds")
+
+rm(rf)
+rm(nb)
+rm(svm)
+
+model1_results
+```
+
+### Part 3 - Modelling with all features
+#### 1. Train models
+```{r train_models2, message=FALSE}
+
+# Select features
+selected_feature_cols <- feature_cols
+
+# Create train and test vectors
+X_train <- dt_train[, ..selected_feature_cols]
+y_train <- dt_train$classe
+X_test <- dt_test[, ..selected_feature_cols]
+y_test <- dt_test$classe
+
+# Define some variables
+seed <- 7
+set.seed(seed)
+metric <- "Accuracy"
+
+## Models were already trained, loading from disk instead
+# Train models
+#control <- trainControl(method="cv", number=4, verboseIter = FALSE)
+#tunegrid <- expand.grid(.mtry=c(5:10))
+#rf <- train(X_train, y_train, method="rf", metric=metric, tuneGrid=tunegrid, trControl=control)
+#nb = train(X_train, y_train,'nb', trControl=trainControl(method='cv',number=4))
+#svm = train(X_train, y_train,'svmLinear', trControl=trainControl(method='cv',number=4))
+
+rf <- readRDS("./rf_all_feats.rds")
+nb <- readRDS("./nb_all_feats.rds")
+svm <- readRDS("./svm_all_feats.rds")
+```
+
+```{r print_train_res2, message=FALSE, WARNING=FALSE}
+print(nb)
+print(rf)
+print(svm)
+```
+
+#### 2. Test models
+```{r test_models2, eval=TRUE}
+# Test models (not possible to get results as we don't have the labels)
+#rf_pred <-predict(rf, dt_test)
+#rf_cm <- confusionMatrix(rf_pred, dt_test$classe,  mode = "prec_recall")
+#nb_pred <-predict(nb, dt_test)
+#nb_cm <- confusionMatrix(nb_pred, dt_test$classe, mode = "prec_recall")
+#svm_pred <-predict(svm, dt_test)
+#svm_cm <- confusionMatrix(svm_pred, dt_test$classe,  mode = "prec_recall")
+
+```
+
+#### 3. Save results
+```{r save_results2, eval=TRUE}
+# Save results
+train_accuracies <- c(max(rf$results$Accuracy), max(nb$results$Accuracy), max(svm$results$Accuracy))
+model2_results  <- data.frame("classifier" = c("rf", "nb", "svm"), "train_accuracy"= train_accuracies)
+model2_results$description <- "all_features"
+model2_results$n_features <- length(selected_feature_cols)
+
+saveRDS(rf, "./rf_all_feats.rds")
+saveRDS(nb, "./nb_all_feats.rds")
+saveRDS(svm, "./svm_all_feats.rds")
+
+```
+
+### Part 4 - Evaluation
+```{r eval_results, eval=TRUE}
+model_results <- rbind(model1_results, model2_results)
+model_results$classifier_name <- paste(model_results$classifier, "_", model_results$description, sep = "")
+
+ggplot(model_results, aes(x=classifier_name, y = train_accuracy, fill = classifier)) +
+  geom_bar( stat = "identity") +
+  theme(plot.title = element_text(hjust = 0.5), axis.text.x = element_text(angle = 30, hjust = 1)) +
+  labs(title="Classifier results") 
+```
+
+We can see that the Random Forest performs the best with an accuracy of 99% on the training set.
+
